@@ -26,7 +26,7 @@ By default, sign-symmetry is used for the convlutional layers and
  backpropagation is used for the last layer. 
 Another option is added to use batch-manhattan SGD
  (Liao, Leibo, & Poggio, 2016) in place of standard SGD
- because it was found to improve training with sign-symmetry.
+ because it was previously found to improve training with sign-symmetry.
 It is implemented by extending `torch.optim.SGD`. 
  
 It should be relatively straightforward to extend this package to support
