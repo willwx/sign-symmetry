@@ -3,17 +3,16 @@ Slight modification of torch.optim.SGD
     - `d_p = p.grad.data` is replaced by `d_p = p.grad.data.sign()` in `step()` to implement batch manhattan
 """
 
+import torch
 import torch.optim
 
 
-class BMSGD(torch.optim.SGD):
-    def step(self, closure=None):
-        """Performs a single optimization step.
+class NSCSGD(torch.optim.SGD):
+    def __init__(self, *args, lbound=1e-10, **kwargs):
+        super(NSCSGD, self).__init__(*args, **kwargs)
+        self._lbound = abs(float(lbound))
 
-        Arguments:
-            closure (callable, optional): A closure that reevaluates the model
-                and returns the loss.
-        """
+    def step(self, closure=None):
         loss = None
         if closure is not None:
             loss = closure()
@@ -27,7 +26,7 @@ class BMSGD(torch.optim.SGD):
             for p in group['params']:
                 if p.grad is None:
                     continue
-                d_p = p.grad.data.sign()    # single line change
+                d_p = p.grad.data
                 if weight_decay != 0:
                     d_p.add_(weight_decay, p.data)
                 if momentum != 0:
@@ -43,6 +42,12 @@ class BMSGD(torch.optim.SGD):
                     else:
                         d_p = buf
 
+                # added rountine for preventing sign change
+                pmask = p.data >= 0
+                p_ori = torch.tensor(p.data)
                 p.data.add_(-group['lr'], d_p)
+                flipmask = (p_ori.sign() * p.data.sign()) <= 0
+                p.data.masked_fill_(pmask & flipmask, self._lbound)
+                p.data.masked_fill_(~pmask & flipmask, -self._lbound)
 
         return loss

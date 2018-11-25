@@ -2,12 +2,17 @@
 Modified from https://github.com/pytorch/examples/blob/master/imagenet/main.py
     - Implemented separate learning rates and optimizers for last (fc) layer vs. all other layers
     - Added/modified command line arguments
-        - --algo indicates the asymmetric feedback algorithm to use for non-last layers
-        - --last-layer-algo indicates the asymmetric feedback algorithm to use for the last layer
-        - --batch-manhattan activates the batch manhattan SGD optimizer for all layers except last fc layer
-        - --last-layer-batch-manhattan activates the batch manhattan SGD optimizer for the last layer
-        - --learning-rate no longer applies to last layer; --last-layer-learning-rate controls it
-        - --lr-decay sets num of epochs by which to decrease both lr's 10-fold
+        - --algo
+        - --last-layer-algo
+        - --batch-manhattan
+        - --last-layer-batch-manhattan
+        - --no-sign-change
+        - --last-layer-no-sign-change
+        - --learning-rate
+        - --last-layer-learning-rate
+        - --lr-decay
+        - --save-every-epoch
+        - --save-every-n-epochs
 Reference for training settings:
     - https://github.com/pytorch/examples/tree/master/imagenet
 """
@@ -30,27 +35,45 @@ import torch.utils.data.distributed
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 
-import torch.optim
-import bm_sgd
-
+from optim.bm_nsc_sgd import BMNSC_SGD
 
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
-parser.add_argument('data', metavar='DIR',
-                    help='path to dataset')
 parser.add_argument('--algo', default='sign_symmetry', type=str, metavar='ALGO',
                     help='algorithm for asymmetric feedback weight; ' +
-                         'options: sign_symmetry, feedback_alignment, sham, or None; ' +
+                         'options: sign_symmetry, feedback_alignment, ' +
+                         'sham, feedback_alignment_signed_init, ' +
+                         'sign_symmetry_random_weights, or None; ' +
                          'None indicates to use unmodified torchvision reference model ' +
                          '(default: sign_symmetry)')
 parser.add_argument('--last-layer-algo', '--lalgo', default='None', type=str, metavar='ALGO',
                     help='algorithm for asymmetric feedback weight for last layer; ' +
-                         'options: sign_symmetry, feedback_alignment, sham, or None; ' +
                          'None indicates to use unmodified torch.nn module ' +
                          'disabled if --algo is None (default: None)')
 parser.add_argument('--batch-manhattan', '--bm', dest='batch_manhattan',
-                    action='store_true', help='use batch manhattan')
+                    action='store_true', help='use batch manhattan for non-last layers')
 parser.add_argument('--last-layer-batch-manhattan', '--lbm', dest='last_layer_batch_manhattan',
-                    action='store_true', help='use batch manhattan')
+                    action='store_true', help='use batch manhattan for last layer')
+parser.add_argument('--no-sign-change', '--nsc', dest='no_sign_change',
+                    action='store_true', help='use no sign-change for non-last layers')
+parser.add_argument('--last-layer-no-sign-change', '--lnsc', dest='last_layer_no_sign_change',
+                    action='store_true', help='use no sign-change for last layer')
+parser.add_argument('--lr', '--learning-rate', default=0.1, type=float,
+                    metavar='LR', help='initial learning rate')
+parser.add_argument('--llr', '--last-layer-learning-rate', default=0.1, type=float,
+                    metavar='LLR', help='initial learning rate')
+parser.add_argument('--lr-decay', '--lrd', default=10, type=int, metavar='LRD',
+                    help='number of epochs after which lr is decreased 10x (default: 10)')
+parser.add_argument('--save-every-epoch', '--see', dest='save_every_epoch',
+                    action='store_true', help='save every epoch ' +
+                    '(each to a unique name to prevent overwriting)')
+parser.add_argument('--save-every-n-epochs', '--sene', default=-1, type=int, metavar='EPOCH',
+                    help='if set and > 0, saves every n epochs '
+                    '(each to a unique name to prevent overwriting)')
+parser.add_argument('--prefix', metavar='DIR', default='.',
+                    help='path to save files')
+
+parser.add_argument('data', metavar='DIR',
+                    help='path to dataset')
 parser.add_argument('--arch', '-a', metavar='ARCH', default='resnet18')
 parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
@@ -60,12 +83,6 @@ parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
 parser.add_argument('-b', '--batch-size', default=256, type=int,
                     metavar='N', help='mini-batch size (default: 256)')
-parser.add_argument('--lr', '--learning-rate', default=0.1, type=float,
-                    metavar='LR', help='initial learning rate')
-parser.add_argument('--llr', '--last-layer-learning-rate', default=0.1, type=float,
-                    metavar='LLR', help='initial learning rate')
-parser.add_argument('--lr-decay', '--lrd', default=10, type=int, metavar='LRD',
-                    help='number of epochs after which lr is decreased 10x (default: 10)')
 parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
                     help='momentum')
 parser.add_argument('--weight-decay', '--wd', default=1e-4, type=float,
@@ -97,6 +114,7 @@ def main():
     args = parser.parse_args()
     lr_decay = args.lr_decay
 
+    os.makedirs(args.prefix, exist_ok=True)
     if args.algo == 'None':
         import torchvision.models as models
     else:
@@ -117,7 +135,6 @@ def main():
                       'disable data parallelism.')
 
     args.distributed = args.world_size > 1
-
     if args.distributed:
         dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
                                 world_size=args.world_size)
@@ -135,11 +152,12 @@ def main():
             'only resnets or alexnet supported'
         if args.pretrained:
             raise ValueError("Using non-standard models but pretrained set to True")
-        print("=> creating asymmetric feedback model '{}'".format(args.arch) +
+        print("=> creating asymmetric feedback model '{}' ".format(args.arch) +
               "with non-last layer af_algo '{}' and last layer af_algo '{}'".
               format(args.algo, args.last_layer_algo))
-        model = models.__dict__[args.arch](af_algo=args.algo,
-                                           last_layer_af_algo=args.last_layer_algo)
+        model = models.__dict__[args.arch](
+            af_algo=args.algo, last_layer_af_algo=args.last_layer_algo
+        )
 
     if args.gpu is not None:
         model = model.cuda(args.gpu)
@@ -155,54 +173,77 @@ def main():
 
     if args.gpu is not None:
         if args.arch.startswith('resnet'):
-            model_last_parameters = list(model.fc.parameters())
+            model_last_named_parameters = list(model.fc.named_parameters())
         elif args.arch.startswith('alexnet'):
-            model_last_parameters = list(model.classifier[-1].parameters())
+            model_last_named_parameters = list(model.classifier[-1].named_parameters())
     else:
         if args.arch.startswith('resnet'):
-            model_last_parameters = list(model.module.fc.parameters())
+            model_last_named_parameters = list(model.module.fc.named_parameters())
         elif args.arch.startswith('alexnet'):
             if args.distributed:
-                model_last_parameters = list(model.module.classifier[-1].parameters())
+                model_last_named_parameters = list(model.module.classifier[-1].named_parameters())
             else:
-                model_last_parameters = list(model.classifier[-1].parameters())
+                model_last_named_parameters = list(model.classifier[-1].named_parameters())
 
-    model_nonlast_parameters = [p for p in model.parameters() if
-                                not any([p is p_last for p_last in model_last_parameters])]
+    model_last_parameters = [nparam[1] for nparam in model_last_named_parameters]
+    model_nonlast_named_parameters = \
+        [nparam for nparam in model.named_parameters()
+         if not any([nparam[1] is p_last for p_last in model_last_parameters])]
+    model_nonlast_parameters = [nparam[1] for nparam in model_nonlast_named_parameters]
 
     # define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().cuda(args.gpu)
-    if args.batch_manhattan:
-        print('using batch manhattan SGD for non-last layers, lr = %.0e' % args.lr)
-        optimizer1 = bm_sgd.BMSGD(model_nonlast_parameters, args.lr,
-                                  momentum=args.momentum, weight_decay=args.weight_decay)
-    else:
-        print('not using batch manhattan SGD for non-last layers, lr = %.0e' % args.lr)
-        optimizer1 = torch.optim.SGD(model_nonlast_parameters, args.lr,
-                                     momentum=args.momentum, weight_decay=args.weight_decay)
-    if args.last_layer_batch_manhattan:
-        print('using batch manhattan SGD for last layer, lr = %.0e' % args.llr)
-        optimizer2 = bm_sgd.BMSGD(model_last_parameters, args.llr,
-                                  momentum=args.momentum, weight_decay=args.weight_decay)
-    else:
-        print('not using batch manhattan SGD for last layer, lr = %.0e' % args.llr)
-        optimizer2 = torch.optim.SGD(model_last_parameters, args.llr,
-                                     momentum=args.momentum, weight_decay=args.weight_decay)
+    param_groups = []
+    lrs = []
+    for use_bm, use_nsc, params, named_params, lr, label in zip(
+            (args.batch_manhattan, args.last_layer_batch_manhattan),
+            (args.no_sign_change, args.last_layer_no_sign_change),
+            (model_nonlast_parameters, model_last_parameters),
+            (model_nonlast_named_parameters, model_last_named_parameters),
+            (args.lr, args.llr),
+            ('non-last', 'last')
+    ):
+        print('%s layer(s): lr = %.0e%s%s' %
+              (label, lr, ('', ', using Batch Manhattan')[use_bm],
+               ('', ', using No-sign-change (bias excluded)')[use_nsc]))
+        if use_nsc:
+            bias_params = []
+            nonbias_params = []
+            for nparam in named_params:
+                if nparam[0].rfind('bias') == len(nparam[0]) - 4:
+                    bias_params.append(nparam[1])
+                else:
+                    nonbias_params.append(nparam[1])
+            paramss = [bias_params, nonbias_params]
+            use_nscs = [False, True]
+        else:
+            paramss = [params]
+            use_nscs = [False]
+
+        for params_, use_nsc_ in zip(paramss, use_nscs):
+            param_groups.append({
+                'params': params_,
+                'lr': lr,
+                'batch_manhattan': use_bm,
+                'no_sign_change': use_nsc_,
+            })
+            lrs.append(lr)
+    optimizer = BMNSC_SGD(param_groups, momentum=args.momentum, weight_decay=args.weight_decay)
 
     # optionally resume from a checkpoint
     if args.resume:
-        if os.path.isfile(args.resume):
+        resumefpath = os.path.join(args.prefix, args.resume)
+        if os.path.isfile(resumefpath):
             print("=> loading checkpoint '{}'".format(args.resume))
-            checkpoint = torch.load(args.resume)
+            checkpoint = torch.load(resumefpath)
             args.start_epoch = checkpoint['epoch']
             best_prec1 = checkpoint['best_prec1']
             model.load_state_dict(checkpoint['state_dict'])
-            optimizer1.load_state_dict(checkpoint['optimizer1'])
-            optimizer2.load_state_dict(checkpoint['optimizer2'])
+            optimizer.load_state_dict(checkpoint['optimizer'])
             print("=> loaded checkpoint '{}' (epoch {})"
                   .format(args.resume, checkpoint['epoch']))
         else:
-            print("=> no checkpoint found at '{}'".format(args.resume))
+            raise IOError("=> no checkpoint found at '{}'".format(args.resume))
 
     cudnn.benchmark = True
 
@@ -247,11 +288,10 @@ def main():
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
-        adjust_learning_rate(optimizer1, epoch, args.lr)
-        adjust_learning_rate(optimizer2, epoch, args.llr)
+        adjust_learning_rate(optimizer, epoch, lrs)
 
         # train for one epoch
-        train(train_loader, model, criterion, optimizer1, optimizer2, epoch)
+        train(train_loader, model, criterion, optimizer, epoch)
 
         # evaluate on validation set
         prec1 = validate(val_loader, model, criterion)
@@ -259,17 +299,17 @@ def main():
         # remember best prec@1 and save checkpoint
         is_best = prec1 > best_prec1
         best_prec1 = max(prec1, best_prec1)
-        save_checkpoint({
+        save_dict = {
             'epoch': epoch + 1,
             'arch': args.arch,
             'state_dict': model.state_dict(),
             'best_prec1': best_prec1,
-            'optimizer1': optimizer1.state_dict(),
-            'optimizer2': optimizer2.state_dict(),
-        }, is_best)
+            'optimizer': optimizer.state_dict(),
+        }
+        save_checkpoint(save_dict, is_best, epoch)
 
 
-def train(train_loader, model, criterion, optimizer1, optimizer2, epoch):
+def train(train_loader, model, criterion, optimizer, epoch):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
@@ -299,11 +339,9 @@ def train(train_loader, model, criterion, optimizer1, optimizer2, epoch):
         top5.update(prec5[0], input.size(0))
 
         # compute gradient and do SGD step
-        optimizer1.zero_grad()
-        optimizer2.zero_grad()
+        optimizer.zero_grad()
         loss.backward()
-        optimizer1.step()
-        optimizer2.step()
+        optimizer.step()
 
         # measure elapsed time
         batch_time.update(time.time() - end)
@@ -365,10 +403,13 @@ def validate(val_loader, model, criterion):
     return top1.avg
 
 
-def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
-    torch.save(state, filename)
+def save_checkpoint(state, is_best, epoch, filename='checkpoint.pth.tar'):
+    torch.save(state, os.path.join(args.prefix, filename))
     if is_best:
-        shutil.copyfile(filename, 'model_best.pth.tar')
+        shutil.copyfile(filename, os.path.join(args.prefix, 'model_best.pth.tar'))
+    if args.save_every_epoch \
+            or (args.save_every_n_epochs > 0 and epoch % args.save_every_n_epochs == 0):
+        shutil.copyfile(filename, os.path.join(args.prefix, 'epoch%03d.pth.tar' % epoch))
 
 
 class AverageMeter(object):
@@ -389,10 +430,10 @@ class AverageMeter(object):
         self.avg = self.sum / self.count
 
 
-def adjust_learning_rate(optimizer, epoch, lr0):
+def adjust_learning_rate(optimizer, epoch, lr0s):
     """Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
-    lr = lr0 * (0.1 ** (epoch // lr_decay))
-    for param_group in optimizer.param_groups:
+    for param_group, lr0 in zip(optimizer.param_groups, lr0s):
+        lr = lr0 * (0.1 ** (epoch // lr_decay))
         param_group['lr'] = lr
 
 
