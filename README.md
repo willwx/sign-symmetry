@@ -28,10 +28,6 @@ Another option is added to use batch-manhattan SGD
  (Liao, Leibo, & Poggio, 2016) in place of standard SGD
  because it was found to improve training with sign-symmetry.
 It is implemented by extending `torch.optim.SGD`. 
-
-Use demo.py to compare a sign-symmetry ResNet-18 model with a standard
- one (as defined in `torchvision.models`) to verify that the
- sign-symmetry model behaves as expected.
  
 It should be relatively straightforward to extend this package to support
  other network architectures.  
