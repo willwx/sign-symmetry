@@ -406,7 +406,7 @@ def validate(val_loader, model, criterion):
 def save_checkpoint(state, is_best, epoch, filename='checkpoint.pth.tar'):
     torch.save(state, os.path.join(args.prefix, filename))
     if is_best:
-        shutil.copyfile(filename, os.path.join(args.prefix, 'model_best.pth.tar'))
+        shutil.copyfile(os.path.join(args.prefix, filename), os.path.join(args.prefix, 'model_best.pth.tar'))
     if args.save_every_epoch \
             or (args.save_every_n_epochs > 0 and epoch % args.save_every_n_epochs == 0):
         shutil.copyfile(filename, os.path.join(args.prefix, 'epoch%03d.pth.tar' % epoch))
